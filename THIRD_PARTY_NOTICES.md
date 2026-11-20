@@ -2,7 +2,7 @@
 
 本文件只覆盖仓库源码之外、由 `pnpm-lock.yaml` 安装进来的依赖，以及安装后才会下载的运行时二进制。它不是法律审计。`package.json` 里的 `"license": "MIT"` 只表示本仓库中 Xiaobin Zeng 有权开放的原创源码和文档；它不把第三方代码重新许可成 MIT。
 
-统计来自当前工作区已安装包的 `package.json` `license` 字段，对照锁定版本，共 943 个不重复的包名加版本。没有逐份阅读每个依赖的许可证全文，也没有审查原生 SDK、应用商店或操作系统自带组件。
+统计范围是按 `pnpm-lock.yaml` 在当前平台安装后的包：只读取这些已安装包 `package.json` 的 `license` 字段，并对照锁文件中的版本。锁文件还列出其他操作系统和 CPU 的可选二进制，那些包不会在每一台机器上安装，所以这里不写一个跨平台的包总数。没有逐份阅读每个依赖的许可证全文，也没有审查原生 SDK、应用商店或操作系统自带组件。
 
 ## 直接依赖
 
@@ -42,7 +42,6 @@
 | lightningcss、lightningcss-linux-x64-gnu | 1.27.0       | MPL-2.0                            | 这些文件继续适用 MPL-2.0。修改它们时要按 MPL 提供对应源码。                     |
 | caniuse-lite                             | 1.0.30001826 | CC-BY-4.0                          | 数据文件需要保留署名，不能改写成 MIT。                                          |
 | node-forge                               | 1.4.3        | BSD-3-Clause OR GPL-2.0            | 双许可。本项目选择 BSD-3-Clause 这一支，不选择 GPL-2.0。                        |
-| expand-template                          | 2.0.3        | MIT OR WTFPL                       | 双许可。按 MIT 一侧理解。                                                       |
 | rc                                       | 1.2.8        | BSD-2-Clause OR MIT OR Apache-2.0  | 多许可，不需要接受其中最严格的一支。                                            |
 | argparse                                 | 2.0.1        | Python-2.0                         | 保留 Python 2.0 许可，不改成 MIT。                                              |
 | qrcode-terminal                          | 0.11.0       | `licenses` 字段写着 Apache 2.0     | 元数据格式不标准，但指向 Apache-2.0。                                           |
