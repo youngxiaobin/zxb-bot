@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "zxb bot",
+    "slug": "personal-agent",
+    "scheme": "personal-agent",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": false,
+    "plugins": ["expo-router", "expo-secure-store"],
+    "experiments": { "typedRoutes": false }
+  }
+}
