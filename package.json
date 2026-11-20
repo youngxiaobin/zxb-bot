@@ -1,0 +1,39 @@
+{
+  "name": "personal-agent",
+  "private": true,
+  "version": "0.1.0",
+  "description": "单人、单网关、多设备的本地 zxb bot。",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@pa/contracts": "workspace:*",
+    "@pa/gateway": "workspace:*",
+    "@pa/persistence": "workspace:*",
+    "@pa/runtime": "workspace:*",
+    "@pa/sdk": "workspace:*"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev:gateway": "node --import tsx apps/gateway/src/main.ts",
+    "dev:cli": "node --import tsx apps/cli/src/main.ts",
+    "pairing-code": "node --import tsx apps/cli/src/main.ts pairing-code",
+    "dev:desktop": "pnpm --filter @pa/desktop dev:web",
+    "dev:electron": "pnpm --filter @pa/desktop dev:electron",
+    "typecheck": "tsc -b tsconfig.build.json --pretty false",
+    "typecheck:mobile": "pnpm --filter @pa/mobile typecheck",
+    "lint": "biome check .",
+    "test": "node scripts/check-engines.mjs && node --import tsx --test --test-concurrency=1 tests/p0/*.test.ts",
+    "test:live": "node --import tsx --test tests/live/*.test.ts",
+    "build": "tsc -b tsconfig.build.json --pretty false && pnpm --filter @pa/desktop build",
+    "check": "node scripts/check-engines.mjs && pnpm typecheck && pnpm typecheck:mobile && pnpm lint && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8",
+    "@types/node": "22.19.1",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@pa/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@pa/contracts": "workspace:*",
+    "@pa/persistence": "workspace:*",
+    "@pa/runtime": "workspace:*",
+    "ws": "8.18.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1"
+  }
+}

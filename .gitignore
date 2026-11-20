@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.turbo/
+.expo/
+*.tsbuildinfo
+data/
+artifacts/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+.env.*
+!.env.example
+.DS_Store
+out/
+.vite/
+apps/desktop/.vite

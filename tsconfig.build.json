@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/contracts" },
+    { "path": "packages/sdk" },
+    { "path": "packages/persistence" },
+    { "path": "packages/runtime" },
+    { "path": "apps/gateway" },
+    { "path": "apps/cli" },
+    { "path": "apps/desktop" }
+  ]
+}
