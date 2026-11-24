@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useLayoutEffect,
   useRef,
   useState,
@@ -56,6 +57,7 @@ export function App() {
   const projection = bridge ? bridgeSnapshot : browserSnapshot;
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [presetId, setPresetId] = useState<string | null>(null);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [mobileChat, setMobileChat] = useState(false);
   const [draft, setDraft] = useState("");
   const [mode, setMode] = useState<"demo" | "live">("demo");
@@ -72,7 +74,9 @@ export function App() {
   const settingsAnchor = useRef<HTMLButtonElement>(null);
 
   const sessions = projection?.sessions ?? [];
-  const active = sessions.find((session) => session.id === sessionId) ?? null;
+  const active = approvalsOpen
+    ? null
+    : (sessions.find((session) => session.id === sessionId) ?? null);
   const messages = active ? (projection?.messages[active.id] ?? []) : [];
   const runs = Object.values(projection?.runs ?? {}).filter(
     (run) => run.sessionId === active?.id && run.kind === "root",
@@ -84,9 +88,13 @@ export function App() {
   const specialists = activeRun
     ? (projection?.specialists[activeRun.id] ?? [])
     : [];
-  const approvals = (projection?.approvals ?? []).filter(
-    (item) => item.sessionId === active?.id,
-  );
+  const allApprovals = projection?.approvals ?? [];
+  const pendingApprovals = allApprovals.filter(
+    (item) => item.status === "pending",
+  ).length;
+  const approvals = approvalsOpen
+    ? allApprovals
+    : allApprovals.filter((item) => item.sessionId === active?.id);
   const sensitiveReady = projection?.sensitiveReady ?? false;
   const connected = projection?.connection === "live";
   const query = search.trim().toLowerCase();
@@ -105,11 +113,26 @@ export function App() {
       preset.hint.toLowerCase().includes(query),
   );
 
-  async function refreshBridge() {
-    const current = window.personalAgent;
-    if (!current) return;
-    setBridgeSnapshot(await current.getSnapshot());
-  }
+  useEffect(() => {
+    if (!bridge) return;
+    let waitingForInitial = true;
+    const stop = bridge.subscribe((snapshot) => {
+      waitingForInitial = false;
+      setBridgeSnapshot(snapshot);
+    });
+    void bridge
+      .getSnapshot()
+      .then((snapshot) => {
+        if (waitingForInitial) setBridgeSnapshot(snapshot);
+      })
+      .catch(() => {
+        if (waitingForInitial) setNotice("无法读取本机 Gateway 连接状态。");
+      });
+    return () => {
+      waitingForInitial = false;
+      stop();
+    };
+  }, []);
 
   async function connectPair() {
     const url = readUrl();
@@ -123,7 +146,8 @@ export function App() {
           code: code.trim(),
           deviceLabel: "桌面",
         });
-        await refreshBridge();
+        setSessionId(null);
+        setPresetId(null);
       } else {
         await switchBrowser(url, async (next) => {
           await next.redeem({
@@ -156,7 +180,8 @@ export function App() {
     try {
       if (bridge) {
         await bridge.adopt({ baseUrl: url, token: token.trim() });
-        await refreshBridge();
+        setSessionId(null);
+        setPresetId(null);
       } else {
         await switchBrowser(url, async (next) => {
           await next.adoptToken(token.trim());
@@ -253,20 +278,21 @@ export function App() {
       if (bridge) {
         const result = (await bridge.command({
           type: "session.open",
-          title: "新的委托",
+          payload: { title: "新的委托" },
         })) as { result?: { sessionId?: string } };
         if (result.result?.sessionId) {
           setSessionId(result.result.sessionId);
           setPresetId(null);
+          setApprovalsOpen(false);
           setMobileChat(true);
         }
-        await refreshBridge();
       } else if (browser) {
         const opened = await browser.openSession("新的委托");
         setSessionId(
           String((opened.result as { sessionId: string }).sessionId),
         );
         setPresetId(null);
+        setApprovalsOpen(false);
         setMobileChat(true);
         await browser.resync();
       }
@@ -285,11 +311,8 @@ export function App() {
       if (bridge) {
         await bridge.command({
           type: "message.submit",
-          sessionId: active.id,
-          text: draft,
-          providerMode: mode,
+          payload: { sessionId: active.id, text: draft, providerMode: mode },
         });
-        await refreshBridge();
       } else {
         await browser?.submit({
           sessionId: active.id,
@@ -319,12 +342,13 @@ export function App() {
       if (bridge) {
         await bridge.command({
           type: "approval.decide",
-          approvalId,
-          decision,
-          expectedVersion: version,
-          paramsHash,
+          payload: {
+            approvalId,
+            decision,
+            expectedVersion: version,
+            paramsHash,
+          },
         });
-        await refreshBridge();
       } else {
         await browser?.decide({
           approvalId,
@@ -345,15 +369,19 @@ export function App() {
     }
     try {
       if (bridge)
-        await bridge.command({ type: "run.cancel", runId: activeRun.id });
+        await bridge.command({
+          type: "run.cancel",
+          payload: { runId: activeRun.id },
+        });
       else await browser?.cancel(activeRun.id);
-      await refreshBridge();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "取消失败");
     }
   }
 
-  const preset = PRESETS.find((item) => item.id === presetId) ?? null;
+  const preset = approvalsOpen
+    ? null
+    : (PRESETS.find((item) => item.id === presetId) ?? null);
   const sendReason = !connected
     ? "连接后才能发送"
     : preset
@@ -394,6 +422,23 @@ export function App() {
           </button>
         </div>
         <div className="list">
+          <button
+            className={approvalsOpen ? "row-btn active" : "row-btn"}
+            type="button"
+            data-action="open-approvals"
+            aria-pressed={approvalsOpen}
+            onClick={() => {
+              setApprovalsOpen(true);
+              setMobileChat(true);
+            }}
+          >
+            <span className="row-copy">
+              <strong>审批收件箱</strong>
+              {pendingApprovals > 0 ? (
+                <span>{pendingApprovals} 项待处理</span>
+              ) : null}
+            </span>
+          </button>
           {visibleSessions.length === 0 ? (
             <p className="muted">没有匹配的会话。连接后可以新建。</p>
           ) : null}
@@ -409,6 +454,7 @@ export function App() {
               onClick={() => {
                 setSessionId(session.id);
                 setPresetId(null);
+                setApprovalsOpen(false);
                 setMobileChat(true);
               }}
             >
@@ -423,10 +469,11 @@ export function App() {
           {visiblePresets.map((item) => (
             <button
               key={item.id}
-              className={presetId === item.id ? "preset active" : "preset"}
+              className={preset?.id === item.id ? "preset active" : "preset"}
               type="button"
               onClick={() => {
                 setPresetId(item.id);
+                setApprovalsOpen(false);
                 setMobileChat(true);
               }}
             >
@@ -592,11 +639,17 @@ export function App() {
             返回
           </button>
           <div className="capsule">
-            <span className="avatar sm">z</span>
-            zxb bot
-            <span className="mode">
-              {mode === "demo" ? "演示 · 不是大模型" : "实况"}
-            </span>
+            {approvalsOpen ? (
+              "审批收件箱"
+            ) : (
+              <>
+                <span className="avatar sm">z</span>
+                zxb bot
+                <span className="mode">
+                  {mode === "demo" ? "演示 · 不是大模型" : "实况"}
+                </span>
+              </>
+            )}
           </div>
         </div>
         <div className="transcript">
@@ -616,9 +669,14 @@ export function App() {
               <p>{preset.hint}。它不是另一个机器人，也不会单独保存会话。</p>
             </article>
           ) : null}
-          {!preset && !active ? (
+          {!approvalsOpen && !preset && !active ? (
             <p className="empty">
               选择一个会话，或新建一次委托。zxb bot 会在写入前停下等你批准。
+            </p>
+          ) : null}
+          {approvalsOpen && approvals.length === 0 ? (
+            <p className="empty">
+              {connected ? "暂无审批。" : "连接后可查看审批。"}
             </p>
           ) : null}
           {messages.map((message) => (
@@ -717,7 +775,7 @@ export function App() {
             </article>
           ))}
         </div>
-        <div className="composer-wrap">
+        <div className="composer-wrap" hidden={approvalsOpen}>
           {menuOpen ? (
             <div className="menu">
               <button

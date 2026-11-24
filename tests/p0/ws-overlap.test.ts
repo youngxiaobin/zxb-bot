@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { ClientFrameSchema, PROTOCOL, WS_PROTOCOL } from "@pa/contracts";
 import { bootGateway, openAndSubmit, summary } from "../helpers.js";
 
 test("WS replay and live overlap deliver each event id once", async () => {
@@ -148,3 +149,82 @@ async function collectFrames(baseUrl: string, token: string, cursor: string) {
   });
   return frames;
 }
+
+test("revoking a device closes its existing realtime connection", async () => {
+  const ctx = await bootGateway();
+  try {
+    const owner = await ctx.pair("所有者");
+    const device = await ctx.pair("待吊销设备");
+    const id = device.getSnapshot().self?.deviceId;
+    assert.ok(id);
+    const commandId = crypto.randomUUID();
+    await owner.send({
+      protocol: PROTOCOL,
+      commandId,
+      idempotencyKey: commandId,
+      type: "device.revoke",
+      payload: { deviceId: id },
+    });
+    const revoked = await device.waitFor(
+      (projection) => projection.connection === "unauthorized",
+      2000,
+    );
+    assert.equal(revoked.sensitiveReady, false);
+    await openAndSubmit(owner, "吊销后的正常任务");
+    assert.equal(device.getSnapshot().approvals.length, 0);
+  } finally {
+    await ctx.cleanup();
+  }
+});
+
+test("realtime authorization expires even when the connection is idle", async () => {
+  const ctx = await bootGateway({ deviceTokenTtlMs: 800, sweepMs: 20 });
+  try {
+    const device = await ctx.pair("短有效期设备");
+    assert.equal(device.getSnapshot().connection, "live");
+    await device.waitFor(
+      (projection) => projection.connection === "unauthorized",
+      3000,
+    );
+  } finally {
+    await ctx.cleanup();
+  }
+});
+
+test("an incomplete pong is rejected and a valid subscribe still works", async () => {
+  const ctx = await bootGateway();
+  const code = ctx.gateway.store.mintPairing(60_000).code;
+  const { token } = ctx.gateway.store.redeemPairing(
+    code,
+    "帧校验",
+    "test",
+    60_000,
+  );
+  const socket = new WebSocket(
+    `${ctx.gateway.baseUrl.replace(/^http/, "ws")}/v1/ws`,
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("等待订阅超时")), 3000);
+      socket.addEventListener("open", () => {
+        socket.send(
+          JSON.stringify({ type: "hello", protocol: WS_PROTOCOL, token }),
+        );
+      });
+      socket.addEventListener("message", (event) => {
+        const frame = ClientFrameSchema.parse(JSON.parse(String(event.data)));
+        if (frame.type === "hello.ok") {
+          socket.send(JSON.stringify({ type: "pong" }));
+        } else if (frame.type === "error" && frame.code === "MALFORMED") {
+          socket.send(JSON.stringify({ type: "subscribe", cursor: null }));
+        } else if (frame.type === "subscribed") {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+  } finally {
+    socket.close();
+    await ctx.cleanup();
+  }
+});

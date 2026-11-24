@@ -33,3 +33,17 @@ test("desktop preload keeps the renderer isolated", () => {
     /localStorage/,
   );
 });
+
+test("desktop build includes the native entry and sandbox preload", () => {
+  const desktop = JSON.parse(
+    fs.readFileSync("apps/desktop/package.json", "utf8"),
+  ) as { main: string; scripts: Record<string, string> };
+  assert.equal(desktop.main, "dist/electron/main/main.cjs");
+  assert.match(desktop.scripts["dev:electron"], /\belectron \./);
+  assert.match(desktop.scripts.build, /--mode electron-main/);
+  assert.match(desktop.scripts.build, /--mode electron-preload/);
+  assert.match(
+    fs.readFileSync("apps/desktop/src/main/main.ts", "utf8"),
+    /dist\/electron\/preload\/preload\.cjs/,
+  );
+});

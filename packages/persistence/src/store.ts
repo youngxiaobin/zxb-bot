@@ -31,6 +31,8 @@ import { openAppDatabase, pidAlive } from "./open.js";
 
 type SqlRow = Record<string, unknown>;
 
+const ACTIVE_RUN_STATUSES = new Set(["queued", "running", "awaiting_approval"]);
+
 export type AuthContext = {
   userId: string;
   deviceId: string;
@@ -664,10 +666,11 @@ export class AppStore {
     const stamp = nowIso();
     this.db
       .prepare(
-        "UPDATE runs SET status='cancelled', result_code='user_cancelled', cancel_requested_at=?, terminal_at=?, updated_at=?, active_deadline_at=NULL WHERE id=?",
+        "UPDATE runs SET status='cancelled', stage='done', result_code='user_cancelled', cancel_requested_at=?, terminal_at=?, updated_at=?, active_deadline_at=NULL WHERE id=?",
       )
       .run(stamp, stamp, stamp, runId);
-    const events = [
+    const events = this.closeCancelledRunWork(runId, stamp);
+    events.push(
       this.addEvent({
         userId: auth.userId,
         channelId: auth.channelId,
@@ -703,7 +706,7 @@ export class AppStore {
           excerpt: "已接受取消。尚未执行的写入不会开始。",
         },
       }),
-    ];
+    );
     return {
       httpStatus: 200,
       body: { runId, accepted: true, stopped: false },
@@ -729,6 +732,13 @@ export class AppStore {
       throw new DomainError("NOT_FOUND", "审批不存在。");
     const run = this.getRun(String(approval.run_id));
     if (!run) throw new DomainError("NOT_FOUND", "运行不存在。");
+    if (
+      approval.decision === "cancel" ||
+      (approval.status === "pending" &&
+        (run.cancel_requested_at || run.status === "cancelled"))
+    ) {
+      throw new DomainError("RUN_CANCELLED", "运行已取消，不能再接受审批。");
+    }
     if (String(approval.status) === "pending") {
       if (Number(approval.version) !== payload.expectedVersion) {
         throw new DomainError("STALE_APPROVAL_VERSION", "审批版本已变化。");
@@ -742,17 +752,21 @@ export class AppStore {
       if (String(approval.expires_at) <= nowIso()) {
         throw new DomainError("APPROVAL_EXPIRED", "审批已过期。");
       }
-      if (run.cancel_requested_at || run.status === "cancelled") {
-        throw new DomainError("RUN_CANCELLED", "运行已取消，不能再接受审批。");
+      if (!ACTIVE_RUN_STATUSES.has(String(run.status))) {
+        throw new DomainError(
+          "DECISION_CONFLICT",
+          "运行已结束，不能再接受审批。",
+        );
       }
       const stamp = nowIso();
+      const status = payload.decision === "approve" ? "approved" : "rejected";
       const info = this.db
         .prepare(
           `UPDATE approvals SET status=?, decision=?, version=version+1, decided_by_device_id=?, resolved_at=?
            WHERE id=? AND status='pending' AND version=? AND params_hash=?`,
         )
         .run(
-          payload.decision === "approve" ? "approved" : "rejected",
+          status,
           payload.decision,
           auth.deviceId,
           stamp,
@@ -786,6 +800,8 @@ export class AppStore {
           payload: {
             approvalId: payload.approvalId,
             decision: payload.decision,
+            status,
+            version: Number(approval.version) + 1,
             toolCallId: approval.tool_call_id,
             toolName: approval.tool_name,
             resource: approval.resource,
@@ -887,47 +903,53 @@ export class AppStore {
       const events: DurableEvent[] = [];
       for (const approval of rows) {
         const stamp = nowIso();
-        const info = this.db
-          .prepare(
-            "UPDATE approvals SET status='expired', decision='expire', resolved_at=? WHERE id=? AND status='pending'",
-          )
-          .run(stamp, approval.id);
-        if (info.changes !== 1) continue;
-        this.finishReservedTool(
-          String(approval.tool_call_id),
-          "cancelled",
-          "approval_expired",
-          "审批过期，写入没有执行。",
-        );
         const run = this.getRun(String(approval.run_id));
-        if (
-          run &&
-          ["running", "awaiting_approval", "queued"].includes(
-            String(run.status),
-          )
-        ) {
-          this.db
-            .prepare(
-              "UPDATE runs SET status='failed', result_code='approval_expired', error_code='approval_expired', error_message=?, terminal_at=?, updated_at=? WHERE id=?",
-            )
-            .run("审批已过期，调用已终止，没有续期。", stamp, stamp, run.id);
+        const cancelled = Boolean(
+          run?.cancel_requested_at || run?.status === "cancelled",
+        );
+        const approvalEvent = this.closePendingApproval(
+          approval,
+          cancelled ? "cancel" : "expire",
+          stamp,
+        );
+        if (!approvalEvent) continue;
+        events.push(approvalEvent);
+        const tool = this.db
+          .prepare("SELECT * FROM tool_calls WHERE id=?")
+          .get(approval.tool_call_id) as SqlRow | undefined;
+        if (tool) {
+          const event = this.cancelUnstartedTool(
+            tool,
+            cancelled ? "user_cancelled" : "approval_expired",
+          );
+          if (event) events.push(event);
         }
+        if (!run || cancelled || !ACTIVE_RUN_STATUSES.has(String(run.status)))
+          continue;
+        const message = "审批已过期，调用已终止，没有续期。";
+        this.patchRun(String(run.id), {
+          status: "failed",
+          stage: "done",
+          result_code: "approval_expired",
+          error_code: "approval_expired",
+          error_message: message,
+          terminal_at: stamp,
+          active_deadline_at: null,
+        });
         events.push(
           this.addEvent({
             userId: String(approval.user_id),
-            channelId: null,
+            channelId: String(run.channel_id),
             sessionId: String(approval.session_id),
             runId: String(approval.run_id),
-            type: "approval.expired",
+            type: "run.failed",
             payload: {
-              approvalId: approval.id,
               runId: approval.run_id,
-              resource: approval.resource,
-              message: "审批已过期，写入没有执行。",
+              resultCode: "approval_expired",
+              errorCode: "approval_expired",
+              errorMessage: message,
             },
           }),
-        );
-        events.push(
           this.addEvent({
             userId: String(approval.user_id),
             channelId: null,
@@ -1146,7 +1168,7 @@ export class AppStore {
     requiresApproval: boolean;
     approvalTtlMs: number;
   }):
-    | { blocked: true; event: DurableEvent }
+    | { blocked: true; event: DurableEvent | null }
     | {
         blocked: false;
         tool: SqlRow;
@@ -1154,6 +1176,14 @@ export class AppStore {
         events: DurableEvent[];
       } {
     return this.transaction(() => {
+      const root = this.getRun(input.rootRunId);
+      if (
+        !root ||
+        root.cancel_requested_at ||
+        !ACTIVE_RUN_STATUSES.has(String(root.status))
+      ) {
+        return { blocked: true, event: null };
+      }
       const existing = this.db
         .prepare(
           "SELECT * FROM tool_calls WHERE root_run_id=? AND logical_key=?",
@@ -1304,18 +1334,11 @@ export class AppStore {
         .get(toolId) as SqlRow | undefined;
       if (!tool) return { claimed: false, reason: "missing" };
       const root = this.getRun(String(tool.root_run_id));
-      if (
-        root?.cancel_requested_at &&
-        Number(tool.side_effect) === 1 &&
-        fromStatus !== "dispatching"
-      ) {
-        this.finishReservedTool(
-          toolId,
-          "cancelled",
-          "user_cancelled",
-          "取消生效于副作用之前，写入没有执行。",
-        );
+      if (root?.cancel_requested_at || root?.status === "cancelled") {
         return { claimed: false, reason: "cancelled" };
+      }
+      if (!root || !ACTIVE_RUN_STATUSES.has(String(root.status))) {
+        return { claimed: false, reason: "terminal" };
       }
       const info = this.db
         .prepare(
@@ -1358,13 +1381,15 @@ export class AppStore {
     status: string,
     errorCode: string,
     errorMessage: string,
-  ): void {
+  ): boolean {
     const info = this.db
       .prepare(
-        "UPDATE tool_calls SET status=?, error_code=?, error_message=?, updated_at=? WHERE id=? AND status IN ('intent','awaiting_approval','ready','dispatching')",
+        "UPDATE tool_calls SET status=?, error_code=?, error_message=?, updated_at=? WHERE id=? AND status IN ('intent','awaiting_approval','ready')",
       )
       .run(status, errorCode, errorMessage, nowIso(), toolId);
-    if (info.changes === 1) this.countBudget(toolId);
+    if (info.changes !== 1) return false;
+    this.countBudget(toolId);
+    return true;
   }
 
   private countBudget(toolId: string): void {
@@ -1805,6 +1830,176 @@ export class AppStore {
     return this.db
       .prepare(`SELECT * FROM expert_tasks WHERE root_run_id IN (${marks})`)
       .all(...runIds) as SqlRow[];
+  }
+
+  isActiveDevice(auth: AuthContext): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          "SELECT 1 FROM devices WHERE id=? AND user_id=? AND revoked_at IS NULL AND expires_at>?",
+        )
+        .get(auth.deviceId, auth.userId, nowIso()),
+    );
+  }
+
+  reconcileCancelledRuns(): DurableEvent[] {
+    return this.transaction(() => {
+      // 旧版本可能遗留待处理审批，也可能把已取消运行重新写成活跃状态。
+      const runs = this.db
+        .prepare(
+          `SELECT * FROM runs WHERE kind='root' AND cancel_requested_at IS NOT NULL
+           AND status IN ('queued','running','awaiting_approval','cancelled')`,
+        )
+        .all() as SqlRow[];
+      const events: DurableEvent[] = [];
+      for (const run of runs) {
+        const runId = String(run.id);
+        const sessionId = String(run.session_id);
+        const userId = String(run.user_id);
+        const stamp = nowIso();
+        const outcome = this.db
+          .prepare(
+            "SELECT payload_json FROM events WHERE run_id=? AND type='run.outcome' ORDER BY seq DESC LIMIT 1",
+          )
+          .get(runId) as { payload_json: string } | undefined;
+        const previousCode = outcome
+          ? (JSON.parse(outcome.payload_json) as OutcomeView).resultCode
+          : "";
+        const hasCancellationOutcome =
+          previousCode === "user_cancelled" ||
+          previousCode.startsWith("cancelled_with_");
+        events.push(...this.closeCancelledRunWork(runId, stamp));
+        if (run.status === "cancelled" && hasCancellationOutcome) continue;
+        const resultCode = hasCancellationOutcome
+          ? previousCode
+          : "user_cancelled";
+        this.patchRun(runId, {
+          status: "cancelled",
+          stage: "done",
+          result_code: resultCode,
+          terminal_at: String(run.terminal_at ?? run.cancel_requested_at),
+          active_deadline_at: null,
+        });
+        events.push(
+          this.addEvent({
+            userId,
+            channelId: String(run.channel_id),
+            sessionId,
+            runId,
+            type: "run.cancelled",
+            payload: { runId, resultCode },
+          }),
+        );
+        if (!hasCancellationOutcome) {
+          events.push(
+            this.addEvent({
+              userId,
+              channelId: null,
+              sessionId,
+              runId,
+              type: "run.outcome",
+              payload: {
+                runId,
+                sessionId,
+                resultCode,
+                effect: "none",
+                resource: null,
+                excerpt: "运行已取消，未派发的工具不会执行。",
+              },
+            }),
+          );
+        }
+      }
+      return events;
+    });
+  }
+
+  private closeCancelledRunWork(runId: string, stamp: string): DurableEvent[] {
+    const pendingApprovals = this.db
+      .prepare("SELECT * FROM approvals WHERE run_id=? AND status='pending'")
+      .all(runId) as SqlRow[];
+    const unstartedTools = this.db
+      .prepare(
+        "SELECT * FROM tool_calls WHERE root_run_id=? AND status IN ('intent','awaiting_approval','ready')",
+      )
+      .all(runId) as SqlRow[];
+    const events: DurableEvent[] = [];
+    for (const approval of pendingApprovals) {
+      const event = this.closePendingApproval(approval, "cancel", stamp);
+      if (event) events.push(event);
+    }
+    for (const tool of unstartedTools) {
+      const event = this.cancelUnstartedTool(tool, "user_cancelled");
+      if (event) events.push(event);
+    }
+    return events;
+  }
+
+  private closePendingApproval(
+    approval: SqlRow,
+    decision: "cancel" | "expire",
+    stamp: string,
+  ): DurableEvent | null {
+    const cancelled = decision === "cancel";
+    const status = cancelled ? "rejected" : "expired";
+    const result = this.db
+      .prepare(
+        "UPDATE approvals SET status=?, decision=?, version=version+1, resolved_at=? WHERE id=? AND status='pending'",
+      )
+      .run(status, decision, stamp, approval.id);
+    if (result.changes !== 1) return null;
+    return this.addEvent({
+      userId: String(approval.user_id),
+      channelId: null,
+      sessionId: String(approval.session_id),
+      runId: String(approval.run_id),
+      type: cancelled ? "approval.resolved" : "approval.expired",
+      payload: {
+        approvalId: approval.id,
+        runId: approval.run_id,
+        sessionId: approval.session_id,
+        toolCallId: approval.tool_call_id,
+        toolName: approval.tool_name,
+        resource: approval.resource,
+        paramsHash: approval.params_hash,
+        status,
+        decision,
+        version: Number(approval.version) + 1,
+        message: cancelled
+          ? "运行已取消，审批已结束。"
+          : "审批已过期，写入没有执行。",
+      },
+    });
+  }
+
+  private cancelUnstartedTool(
+    tool: SqlRow,
+    errorCode: "user_cancelled" | "approval_expired",
+  ): DurableEvent | null {
+    const message =
+      errorCode === "user_cancelled"
+        ? "运行已取消，工具没有执行。"
+        : "审批过期，写入没有执行。";
+    const toolCallId = String(tool.id);
+    if (!this.finishReservedTool(toolCallId, "cancelled", errorCode, message)) {
+      return null;
+    }
+    return this.addEvent({
+      userId: String(tool.user_id),
+      channelId: null,
+      sessionId: String(tool.session_id),
+      runId: String(tool.root_run_id),
+      taskId: toolCallId,
+      type: "tool.failed",
+      payload: {
+        toolCallId,
+        toolName: tool.tool_name,
+        resource: tool.resource,
+        status: "cancelled",
+        errorCode,
+        message,
+      },
+    });
   }
 }
 

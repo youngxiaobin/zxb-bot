@@ -1,7 +1,11 @@
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import { useEffect } from "react";
+import { startMobileAgent } from "../src/agent";
 
 export default function Layout() {
+  useEffect(startMobileAgent, []);
+
   return (
     <>
       <StatusBar style="dark" />

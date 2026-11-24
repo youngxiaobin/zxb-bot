@@ -21,7 +21,9 @@ test("CLI initiator and CLI approver finish the same run", async () => {
       pairedA.stdout.includes(JSON.parse(fs.readFileSync(credA, "utf8")).token),
       false,
     );
-    assert.equal(fs.statSync(credA).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(credA).mode & 0o777, 0o600);
+    }
     const submitted = await runCli(ctx.gateway.baseUrl, credA, [
       "submit",
       "请根据资料整理摘要并等待批准",
@@ -66,6 +68,29 @@ test("CLI initiator and CLI approver finish the same run", async () => {
     assert.match(text, /已写入/);
     assert.match(text, /SENTINEL_WEEKLY_7F3A/);
     await viewer.disconnect();
+
+    const next = await runCli(ctx.gateway.baseUrl, credA, [
+      "submit",
+      "请在同一个会话里整理第二份摘要",
+    ]);
+    assert.equal(next.code, 0, next.stderr);
+    const nextApprovalId = /等待审批 ([A-Za-z0-9-]{8,80})/.exec(
+      next.stdout,
+    )?.[1];
+    assert.ok(nextApprovalId, next.stdout);
+    assert.notEqual(nextApprovalId, approvalId);
+    assert.doesNotMatch(next.stdout, /已写入/);
+    const snapshot = await fetch(`${ctx.gateway.baseUrl}/v1/snapshot`, {
+      headers: { authorization: `Bearer ${saved.token}` },
+    });
+    const { sessions, approvals } = (await snapshot.json()) as {
+      sessions: Array<{ id: string }>;
+      approvals: Array<{ id: string; sessionId: string; status: string }>;
+    };
+    assert.equal(sessions.length, 1);
+    const nextApproval = approvals.find((item) => item.id === nextApprovalId);
+    assert.equal(nextApproval?.sessionId, sessions[0]?.id);
+    assert.equal(nextApproval?.status, "pending");
   } finally {
     await ctx.cleanup();
   }

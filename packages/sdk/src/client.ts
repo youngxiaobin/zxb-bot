@@ -3,6 +3,7 @@ import {
   ErrorCodes,
   PROTOCOL,
   PROJECTION_VERSION,
+  type ClientFrame,
   type Command,
   type CommandReceipt,
   ClientFrameSchema,
@@ -193,6 +194,8 @@ export class PersonalAgentClient {
 
   async connect(): Promise<void> {
     this.disposed = false;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     const stored = await this.options.persistence?.load();
     const restored = projectionFromStored(stored);
     if (restored)
@@ -437,94 +440,124 @@ export class PersonalAgentClient {
 
   private async openSocket(): Promise<void> {
     const creds = await this.options.credentials.load();
+    if (this.disposed) return;
     if (!creds?.token) {
       this.commit(withConnection(this.projection, "unauthorized"));
+      return;
+    }
+    const hello = HelloSchema.safeParse({
+      type: "hello",
+      protocol: "pa.ws.v1",
+      token: creds.token,
+    });
+    if (!hello.success) {
+      this.commit(withConnection(emptyProjection(), "unauthorized"));
       return;
     }
     const url = `${this.getBaseUrl().replace(/^http/, "ws")}/v1/ws`;
     const factory = this.options.sockets ?? { connect: browserSocket };
     const socket = factory.connect(url);
+    const previous = this.socket;
     this.socket = socket;
-    const opened = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("连接超时")), 5000);
-      const stop = this.subscribe(() => {
-        if (
-          this.projection.connection === "live" ||
-          this.projection.connection === "unauthorized"
-        ) {
+    previous?.close();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error("连接超时"));
+        socket.close();
+      }, 5000);
+      socket.onMessage((data) => {
+        if (this.disposed || this.socket !== socket) return;
+        try {
+          const frame = ClientFrameSchema.parse(JSON.parse(data));
+          this.onFrame(frame);
+          if (frame.type === "subscribed" || frame.type === "hello.error") {
+            clearTimeout(timer);
+            resolve();
+          }
+        } catch {
           clearTimeout(timer);
-          stop();
-          resolve();
+          reject(new Error("网关返回了无效的消息。"));
+          socket.close();
         }
       });
+      socket.onClose(() => {
+        clearTimeout(timer);
+        reject(new Error("连接已断开。"));
+        if (this.socket !== socket) return;
+        this.socket = null;
+        if (this.disposed || this.projection.connection === "unauthorized")
+          return;
+        this.commit(withConnection(this.projection, "reconnecting"));
+        this.scheduleReconnect();
+      });
+      socket.onOpen(() => {
+        if (this.disposed || this.socket !== socket) return;
+        socket.send(JSON.stringify(hello.data));
+      });
     });
-    socket.onMessage((data) => this.onFrame(data));
-    socket.onClose(() => {
-      if (this.socket !== socket) return;
-      this.socket = null;
-      if (this.disposed) return;
-      this.commit(withConnection(this.projection, "reconnecting"));
-      this.scheduleReconnect();
-    });
-    socket.onOpen(() => {
-      socket.send(
-        JSON.stringify(
-          HelloSchema.parse({
-            type: "hello",
-            protocol: "pa.ws.v1",
-            token: creds.token,
-          }),
-        ),
-      );
-    });
-    await opened;
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed) return;
+    if (
+      this.disposed ||
+      this.reconnectTimer ||
+      this.projection.connection === "unauthorized"
+    )
+      return;
     const delay = Math.min(3000, 200 * 2 ** this.attempt);
     this.attempt += 1;
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       void this.openSocket().catch(() => this.scheduleReconnect());
     }, delay);
   }
 
-  private onFrame(data: string): void {
-    if (this.disposed) return;
-    const frame = ClientFrameSchema.parse(JSON.parse(data));
+  private onFrame(frame: ClientFrame): void {
     if (frame.type === "ping") {
       this.socket?.send(JSON.stringify({ type: "pong", nonce: frame.nonce }));
       return;
     }
     if (frame.type === "hello.ok") {
+      const previous = this.projection.self;
+      const sameDevice =
+        !previous ||
+        (previous.userId === frame.userId &&
+          previous.deviceId === frame.deviceId);
+      const current = sameDevice
+        ? this.projection
+        : withConnection(emptyProjection(), this.projection.connection);
       this.commit({
-        ...this.projection,
+        ...current,
         self: { userId: frame.userId, deviceId: frame.deviceId },
       });
-      const cursor = this.projection.cursor;
+      const subscription = SubscribeSchema.safeParse({
+        type: "subscribe",
+        cursor: current.cursor,
+      });
       this.socket?.send(
-        JSON.stringify(SubscribeSchema.parse({ type: "subscribe", cursor })),
+        JSON.stringify(
+          subscription.success
+            ? subscription.data
+            : { type: "subscribe", cursor: null },
+        ),
       );
       return;
     }
     if (frame.type === "hello.error") {
       this.commit({
-        ...withConnection(this.projection, "unauthorized"),
+        ...withConnection(emptyProjection(), "unauthorized"),
         lastError: { code: frame.code, message: frame.message },
       });
+      void this.persist();
       return;
     }
     if (frame.type === "snapshot") {
-      this.commit(
-        withConnection(applySnapshot(this.projection, frame.snapshot), "live"),
-      );
-      this.attempt = 0;
-      void this.persist();
+      this.commit(applySnapshot(this.projection, frame.snapshot));
       return;
     }
     if (frame.type === "event") {
       const event = DurableEventSchema.parse(frame.event);
-      this.commit(withConnection(applyEvent(this.projection, event), "live"));
+      this.commit(applyEvent(this.projection, event));
       void this.persist();
       if (this.projection.lastError?.code === "PROJECTION_CAP")
         void this.resync();
@@ -553,11 +586,18 @@ export class PersonalAgentClient {
         lastError: { code: frame.code, message: frame.message },
       });
       if (
-        frame.code === "CURSOR_EXPIRED" ||
-        frame.code === "CURSOR_FUTURE" ||
-        frame.code === "CURSOR_MALFORMED"
+        this.projection.cursor !== null &&
+        (frame.code === ErrorCodes.CURSOR_EXPIRED ||
+          frame.code === ErrorCodes.CURSOR_FUTURE ||
+          frame.code === ErrorCodes.CURSOR_MALFORMED ||
+          frame.code === ErrorCodes.CURSOR_UNAUTHORIZED)
       ) {
-        void this.resync();
+        this.commit({ ...this.projection, cursor: null });
+        this.socket?.send(
+          JSON.stringify(
+            SubscribeSchema.parse({ type: "subscribe", cursor: null }),
+          ),
+        );
       }
     }
   }

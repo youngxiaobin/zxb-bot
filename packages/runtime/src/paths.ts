@@ -11,6 +11,13 @@ export class PathRejected extends Error {
   }
 }
 
+export class NoteWriteUncertain extends Error {
+  constructor(cause: unknown) {
+    super("笔记文件已创建，但无法确认内容是否完整写入。", { cause });
+    this.name = "NoteWriteUncertain";
+  }
+}
+
 function assertContained(rootReal: string, candidate: string): string {
   const real = fs.realpathSync(candidate);
   const prefix = rootReal.endsWith(path.sep) ? rootReal : rootReal + path.sep;
@@ -83,10 +90,14 @@ export function writeDemoNote(
   }
   const fd = fs.openSync(target, "wx");
   try {
-    fs.writeFileSync(fd, body, "utf8");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    try {
+      fs.writeFileSync(fd, body, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (error) {
+    throw new NoteWriteUncertain(error);
   }
   return { path: `sandbox/notes/${fileName}`, bytes: Buffer.byteLength(body) };
 }

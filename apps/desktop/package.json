@@ -4,10 +4,11 @@
   "private": true,
   "license": "MIT",
   "type": "module",
+  "main": "dist/electron/main/main.cjs",
   "scripts": {
     "dev:web": "vite --host 127.0.0.1 --port 47331 --strictPort",
-    "dev:electron": "electron-forge start",
-    "build": "vite build",
+    "dev:electron": "pnpm build && electron .",
+    "build": "vite build && vite build --mode electron-main && vite build --mode electron-preload",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
@@ -16,11 +17,13 @@
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "scheduler": "0.23.2",
+    "ws": "8.18.3",
     "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/react": "18.3.18",
     "@types/react-dom": "18.3.5",
+    "@types/ws": "8.18.1",
     "@vitejs/plugin-react": "4.7.0",
     "electron": "33.4.11",
     "typescript": "5.9.3",

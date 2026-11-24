@@ -8,7 +8,11 @@ import {
   CommandSchema,
   ErrorCodes,
   FaultNameSchema,
+  HelloSchema,
+  PongSchema,
   SnapshotSchema,
+  SubscribeSchema,
+  WS_PROTOCOL,
   httpStatusForCode,
   isOwnerVisibleEvent,
   type DurableEvent,
@@ -21,7 +25,7 @@ import {
   signCursor,
 } from "@pa/persistence";
 import { AgentRuntime, redactValue } from "@pa/runtime";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { z } from "zod";
 import { assertBindPolicy, healthBody, type GatewayConfig } from "./config.js";
 
@@ -39,6 +43,8 @@ const limitsSchema = z.object({
   delayMs: z.number().int().nonnegative().optional(),
   replayDelayMs: z.number().int().nonnegative().optional(),
 });
+
+const socketFrameSchema = z.union([HelloSchema, SubscribeSchema, PongSchema]);
 
 export async function startGateway(
   config: GatewayConfig,
@@ -67,8 +73,12 @@ export async function startGateway(
   });
   const sockets = new Set<(event: DurableEvent) => void>();
   const previews = new Set<(frame: EphemeralPreview) => void>();
+  const socketAuthorizations = new Set<() => boolean>();
   const publish = (events: DurableEvent[]) => {
     for (const event of events) {
+      if (event.type === "device.revoked") {
+        for (const check of socketAuthorizations) check();
+      }
       const scrubbed = {
         ...event,
         payload: redactValue(event.payload, secrets) as Record<string, unknown>,
@@ -84,6 +94,7 @@ export async function startGateway(
   const sweep = setInterval(() => {
     try {
       if (!store.heartbeat()) return;
+      for (const check of socketAuthorizations) check();
       publish(store.expireApprovals());
     } catch (error) {
       log(
@@ -103,7 +114,7 @@ export async function startGateway(
     }
   });
   const wss = new WebSocketServer({ noServer: true });
-  server.on("upgrade", (req, socket) => {
+  server.on("upgrade", (req, socket, head) => {
     let pathname = "/";
     try {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -128,7 +139,7 @@ export async function startGateway(
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, Buffer.alloc(0), (ws) => acceptSocket(ws));
+    wss.handleUpgrade(req, socket, head, (ws) => acceptSocket(ws));
   });
 
   await new Promise<void>((resolve) =>
@@ -375,118 +386,113 @@ export async function startGateway(
 
   function acceptSocket(ws: WebSocket): void {
     let auth: ReturnType<AppStore["authenticate"]> = null;
-    let unsubscribe = () => {};
+    let unsubscribe: (() => void) | null = null;
     const timer = setInterval(() => {
-      if (ws.readyState === ws.OPEN)
-        ws.send(JSON.stringify({ type: "ping", nonce: String(Date.now()) }));
+      send({ type: "ping", nonce: String(Date.now()) });
     }, 10_000);
     timer.unref?.();
-    ws.on("message", async (raw) => {
+    ws.on("message", (raw) => {
+      void handleFrame(raw).catch((error: unknown) => {
+        log(
+          "websocket frame failed",
+          { message: error instanceof Error ? error.message : "unknown" },
+          secrets,
+        );
+        disconnect();
+        ws.close(1011, "Internal error");
+      });
+    });
+    ws.on("error", () => {
+      disconnect();
+      ws.terminate();
+    });
+    ws.on("close", disconnect);
+
+    async function handleFrame(raw: RawData): Promise<void> {
       let message: unknown;
       try {
         message = JSON.parse(String(raw));
       } catch {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            code: ErrorCodes.MALFORMED,
-            message: "无法解析消息。",
-          }),
-        );
+        send({
+          type: "error",
+          code: ErrorCodes.MALFORMED,
+          message: "无法解析消息。",
+        });
         return;
       }
-      const record = message as {
-        type?: string;
-        token?: string;
-        cursor?: string | null;
-        nonce?: string;
-        protocol?: string;
-      };
+      const parsed = socketFrameSchema.safeParse(message);
+      if (!parsed.success) {
+        send({
+          type: "error",
+          code: ErrorCodes.MALFORMED,
+          message: "消息格式不正确。",
+        });
+        return;
+      }
+      const record = parsed.data;
       if (!auth) {
-        if (
-          record.type !== "hello" ||
-          record.protocol !== "pa.ws.v1" ||
-          typeof record.token !== "string"
-        ) {
-          ws.send(
-            JSON.stringify({
-              type: "hello.error",
-              code: ErrorCodes.UNAUTHORIZED,
-              message: "请先发送 hello。",
-            }),
-          );
-          ws.close();
-          return;
-        }
+        if (record.type !== "hello") return rejectAuth("请先发送 hello。");
         auth = store.authenticate(record.token);
-        if (!auth) {
-          ws.send(
-            JSON.stringify({
-              type: "hello.error",
-              code: ErrorCodes.UNAUTHORIZED,
-              message: "设备令牌无效、过期或已吊销。",
-            }),
-          );
-          ws.close();
-          return;
-        }
-        const current = auth;
-        ws.send(
-          JSON.stringify({
-            type: "hello.ok",
-            protocol: "pa.ws.v1",
-            deviceId: current.deviceId,
-            userId: current.userId,
-          }),
-        );
+        if (!auth) return rejectAuth();
+        socketAuthorizations.add(isAuthorized);
+        send({
+          type: "hello.ok",
+          protocol: WS_PROTOCOL,
+          deviceId: auth.deviceId,
+          userId: auth.userId,
+        });
         return;
       }
+      if (!isAuthorized()) return;
       if (record.type === "pong") return;
-      if (record.type !== "subscribe") {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            code: ErrorCodes.MALFORMED,
-            message: "不支持的消息。",
-          }),
-        );
+      if (record.type !== "subscribe" || unsubscribe) {
+        send({
+          type: "error",
+          code: ErrorCodes.MALFORMED,
+          message: "该消息不适用于当前连接状态。",
+        });
         return;
       }
       const current = auth;
-      const sent = new Set<string>();
+      const checked = record.cursor
+        ? store.checkCursor(record.cursor, current.userId)
+        : null;
+      if (checked && !checked.ok) {
+        send({
+          type: "error",
+          code: checked.code,
+          message: cursorMessage(checked.code),
+        });
+        return;
+      }
       const buffered: DurableEvent[] = [];
       let live = false;
-      const canSee = (event: DurableEvent) => {
-        if (event.userId !== current.userId) return false;
-        if (isOwnerVisibleEvent(event.type)) return true;
-        if (!event.sessionId) return false;
-        const row = store.db
-          .prepare(
-            "SELECT 1 as ok FROM session_grants WHERE session_id=? AND device_id=? AND user_id=?",
-          )
-          .get(event.sessionId, current.deviceId, current.userId);
-        return Boolean(row);
-      };
-      const push = (event: DurableEvent) => {
-        if (!canSee(event) || sent.has(event.eventId)) return;
-        if (!live) buffered.push(event);
-        else {
-          sent.add(event.eventId);
-          ws.send(JSON.stringify({ type: "event", event }));
+      const hasSessionGrant = (sessionId: string) =>
+        Boolean(
+          store.db
+            .prepare(
+              "SELECT 1 FROM session_grants WHERE session_id=? AND device_id=? AND user_id=?",
+            )
+            .get(sessionId, current.deviceId, current.userId),
+        );
+      const fan = (event: DurableEvent) => {
+        if (event.userId !== current.userId || !isAuthorized()) return;
+        if (
+          !isOwnerVisibleEvent(event.type) &&
+          (!event.sessionId || !hasSessionGrant(event.sessionId))
+        ) {
+          return;
         }
+        if (live) send({ type: "event", event });
+        else buffered.push(event);
       };
-      const fan = (event: DurableEvent) => push(event);
       sockets.add(fan);
       const previewFan = (frame: EphemeralPreview) => {
+        if (!isAuthorized()) return;
         const run = store.getRun(frame.runId);
-        if (!run) return;
-        const granted = store.db
-          .prepare(
-            "SELECT 1 as ok FROM session_grants WHERE session_id=? AND device_id=?",
-          )
-          .get(run.session_id, current.deviceId);
-        if (!granted) return;
-        ws.send(JSON.stringify({ type: "ephemeral", ephemeral: frame }));
+        if (run && hasSessionGrant(String(run.session_id))) {
+          send({ type: "ephemeral", ephemeral: frame });
+        }
       };
       previews.add(previewFan);
       unsubscribe = () => {
@@ -494,52 +500,54 @@ export async function startGateway(
         previews.delete(previewFan);
       };
       await runtime.faults.delayReplay();
-      if (!record.cursor) {
+      if (!isAuthorized()) return;
+      let watermarkSeq: number;
+      let watermarkCursor: string | null;
+      let replayed = 0;
+      if (checked) {
+        const replay = store.replay(current, checked.claims.seq);
+        watermarkSeq = replay.watermarkSeq;
+        watermarkCursor = replay.watermarkCursor;
+        replayed = replay.events.length;
+        for (const event of replay.events) send({ type: "event", event });
+      } else {
         const snapshot = store.snapshot(current);
-        ws.send(JSON.stringify({ type: "snapshot", snapshot }));
-        live = true;
-        for (const event of buffered) push(event);
-        ws.send(
-          JSON.stringify({
-            type: "subscribed",
-            watermarkCursor: snapshot.watermarkCursor,
-            replayed: 0,
-          }),
-        );
-        return;
-      }
-      const checked = store.checkCursor(record.cursor, current.userId);
-      if (!checked.ok) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            code: checked.code,
-            message: cursorMessage(checked.code),
-          }),
-        );
-        return;
-      }
-      const replay = store.replay(current, checked.claims.seq);
-      for (const event of replay.events) {
-        sent.add(event.eventId);
-        ws.send(JSON.stringify({ type: "event", event }));
+        watermarkSeq = snapshot.watermarkSeq;
+        watermarkCursor = snapshot.watermarkCursor;
+        send({ type: "snapshot", snapshot });
       }
       live = true;
       for (const event of buffered) {
-        if (event.seq > checked.claims.seq) push(event);
+        if (event.seq > watermarkSeq) fan(event);
       }
-      ws.send(
-        JSON.stringify({
-          type: "subscribed",
-          watermarkCursor: replay.watermarkCursor,
-          replayed: replay.events.length,
-        }),
-      );
-    });
-    ws.on("close", () => {
+      buffered.length = 0;
+      send({ type: "subscribed", watermarkCursor, replayed });
+    }
+
+    function send(frame: Record<string, unknown>): void {
+      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame));
+    }
+
+    function isAuthorized(): boolean {
+      if (!auth || ws.readyState !== ws.OPEN) return false;
+      if (store.isActiveDevice(auth)) return true;
+      rejectAuth();
+      return false;
+    }
+
+    function rejectAuth(message = "设备令牌无效、过期或已吊销。"): void {
+      send({ type: "hello.error", code: ErrorCodes.UNAUTHORIZED, message });
+      disconnect();
+      ws.close(1008, "Unauthorized");
+    }
+
+    function disconnect(): void {
       clearInterval(timer);
-      unsubscribe();
-    });
+      socketAuthorizations.delete(isAuthorized);
+      unsubscribe?.();
+      unsubscribe = null;
+      auth = null;
+    }
   }
 
   return {

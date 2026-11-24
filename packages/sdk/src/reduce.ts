@@ -146,8 +146,12 @@ export function applyEvent(
           budgetReserved: previous?.budgetReserved ?? 0,
           budgetUsed: previous?.budgetUsed ?? 0,
           modelSteps: Number(payload.modelSteps ?? previous?.modelSteps ?? 0),
-          errorCode: previous?.errorCode ?? null,
-          errorMessage: previous?.errorMessage ?? null,
+          errorCode: payload.errorCode
+            ? String(payload.errorCode)
+            : (previous?.errorCode ?? null),
+          errorMessage: payload.errorMessage
+            ? String(payload.errorMessage)
+            : (previous?.errorMessage ?? null),
           createdAt: previous?.createdAt ?? event.createdAt,
           updatedAt: event.createdAt,
         },
@@ -245,7 +249,10 @@ export function applyEvent(
           ? "pending"
           : event.type === "approval.expired"
             ? "expired"
-            : String(payload.decision ?? "resolved"),
+            : String(
+                payload.status ??
+                  (payload.decision === "approve" ? "approved" : "rejected"),
+              ),
       decision: payload.decision
         ? String(payload.decision)
         : (previous?.decision ?? null),

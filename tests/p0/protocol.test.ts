@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createServer } from "node:http";
 import { test } from "node:test";
 import { PROTOCOL } from "@pa/contracts";
 import {
@@ -106,6 +107,14 @@ test("reject writes nothing; cancel before approval writes nothing", async () =>
     ).approvals.find((item) => item.runId === second.runId);
     assert.ok(pending);
     await alpha.cancel(second.runId);
+    await beta.waitFor((projection) =>
+      projection.approvals.some(
+        (item) =>
+          item.id === pending.id &&
+          item.status === "rejected" &&
+          item.decision === "cancel",
+      ),
+    );
     await assert.rejects(
       beta.decide({
         approvalId: pending.id,
@@ -512,6 +521,148 @@ test("demo ignores a configured key; live does not fall back", async () => {
   }
 });
 
+test("live model receives tool outputs with the original call IDs", async () => {
+  const provider = await bootModelProvider((index) => ({
+    message:
+      index === 0
+        ? modelToolCalls([
+            ["list-1", "list_fixtures", {}],
+            ["read-1", "read_fixture", { name: "weekly-notes.md" }],
+          ])
+        : { role: "assistant", content: "已根据资料整理。" },
+  }));
+  const ctx = await bootGateway({ openaiBaseUrl: provider.url });
+  try {
+    const alpha = await ctx.pair("alpha");
+    const { runId } = await openAndSubmit(alpha, "读取周报", "live");
+    const state = await alpha.waitFor((projection) =>
+      projection.outcomes.some((outcome) => outcome.runId === runId),
+    );
+    assert.equal(provider.requests.length, 2);
+    const [assistant, list, read] = provider.requests[1].slice(-3);
+    assert.deepEqual(
+      assistant.tool_calls?.map((call) => call.id),
+      ["list-1", "read-1"],
+    );
+    assert.equal(list.tool_call_id, "list-1");
+    assert.equal(read.tool_call_id, "read-1");
+    assert.ok(
+      JSON.parse(list.content ?? "null").files.includes("weekly-notes.md"),
+    );
+    assert.equal(
+      JSON.parse(read.content ?? "null").text,
+      fs.readFileSync("fixtures/weekly-notes.md", "utf8"),
+    );
+    assert.equal(
+      state.outcomes.find((outcome) => outcome.runId === runId)?.resultCode,
+      "read_only_done",
+    );
+  } finally {
+    await ctx.cleanup();
+    await provider.close();
+  }
+});
+
+test("provider failure settles the run and the session accepts another message", async () => {
+  const provider = await bootModelProvider(() => ({
+    error: `鉴权失败 ${secret}`,
+  }));
+  const ctx = await bootGateway({ openaiBaseUrl: provider.url });
+  try {
+    const alpha = await ctx.pair("alpha");
+    const { runId, sessionId } = await openAndSubmit(alpha, "访问实况", "live");
+    const state = await alpha.waitFor((projection) =>
+      projection.outcomes.some((outcome) => outcome.runId === runId),
+    );
+    assert.equal(
+      state.outcomes.find((outcome) => outcome.runId === runId)?.resultCode,
+      "provider_failed",
+    );
+    assert.equal(
+      (await summary(ctx.gateway.baseUrl)).runs.find((run) => run.id === runId)
+        ?.status,
+      "failed",
+    );
+    assert.equal(JSON.stringify(state).includes(secret), false);
+    assert.equal(state.runs[runId]?.errorCode, "PROVIDER_FAILED");
+    await alpha.resync();
+    assert.equal(alpha.getSnapshot().runs[runId]?.errorCode, "PROVIDER_FAILED");
+    await alpha.submit({
+      sessionId,
+      text: "/slow-read 重试",
+      providerMode: "demo",
+    });
+  } finally {
+    await ctx.cleanup();
+    await provider.close();
+  }
+});
+
+test("a cancelled live run ignores a late write request", async () => {
+  const requestStarted = Promise.withResolvers<void>();
+  const releaseProvider = Promise.withResolvers<void>();
+  const provider = await bootModelProvider(async () => {
+    requestStarted.resolve();
+    await releaseProvider.promise;
+    return {
+      message: modelToolCalls([
+        ["late-write", "write_demo_note", { title: "标题", body: "已取消" }],
+      ]),
+    };
+  });
+  const ctx = await bootGateway({ openaiBaseUrl: provider.url });
+  try {
+    const alpha = await ctx.pair("alpha");
+    const opened = await alpha.openSession("取消实况");
+    const { sessionId } = opened.result as { sessionId: string };
+    const submission = alpha.submit({
+      sessionId,
+      text: "写笔记",
+      providerMode: "live",
+    });
+    try {
+      await Promise.race([requestStarted.promise, submission]);
+      const state = await alpha.waitFor((projection) =>
+        Object.values(projection.runs).some(
+          (run) => run.sessionId === sessionId,
+        ),
+      );
+      const run = Object.values(state.runs).find(
+        (run) => run.sessionId === sessionId,
+      );
+      assert.ok(run);
+      const runId = String(run.id);
+      await alpha.cancel(runId);
+      releaseProvider.resolve();
+      await submission;
+      await alpha.resync();
+      assert.equal(
+        alpha
+          .getSnapshot()
+          .approvals.some((approval) => approval.runId === runId),
+        false,
+      );
+      const settled = await summary(ctx.gateway.baseUrl);
+      assert.equal(
+        settled.runs.find((run) => run.id === runId)?.status,
+        "cancelled",
+      );
+      assert.equal(settled.effects, 0);
+      await alpha.submit({
+        sessionId,
+        text: "/slow-read 继续",
+        providerMode: "demo",
+      });
+    } finally {
+      releaseProvider.resolve();
+      await submission.catch(() => undefined);
+    }
+  } finally {
+    await ctx.cleanup();
+    await provider.close();
+  }
+});
+
 test("tool timeout and expired approval do not write", async () => {
   const slow = await bootGateway({ toolTimeoutMs: 80 });
   try {
@@ -536,17 +687,94 @@ test("tool timeout and expired approval do not write", async () => {
   const expiry = await bootGateway({ approvalTtlMs: 200, sweepMs: 40 });
   try {
     const alpha = await expiry.pair("alpha");
-    await openAndSubmit(alpha, "审批会过期");
-    await alpha.waitFor(
+    const { runId } = await openAndSubmit(alpha, "审批会过期");
+    const expired = await alpha.waitFor(
       (projection) =>
         projection.outcomes.some(
-          (item) => item.resultCode === "approval_expired",
+          (item) =>
+            item.runId === runId && item.resultCode === "approval_expired",
         ),
       4000,
+    );
+    assert.equal(expired.runs[runId]?.status, "failed");
+    assert.equal(expired.runs[runId]?.errorCode, "approval_expired");
+    assert.equal(
+      expired.approvals.find((item) => item.runId === runId)?.status,
+      "expired",
     );
     assert.equal((await summary(expiry.gateway.baseUrl)).effects, 0);
   } finally {
     await expiry.cleanup();
+  }
+});
+
+test("approved write timeout settles the run and releases the session", async () => {
+  const ctx = await bootGateway({ toolTimeoutMs: 80 });
+  try {
+    const alpha = await ctx.pair("alpha");
+    const { runId, sessionId } = await openAndSubmit(alpha, "准备写入");
+    const state = await alpha.waitFor((projection) =>
+      projection.approvals.some((approval) => approval.runId === runId),
+    );
+    const approval = state.approvals.find((item) => item.runId === runId);
+    assert.ok(approval);
+    await fetch(`${ctx.gateway.baseUrl}/v1/test/fault`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "delay_before_tool_effect", delayMs: 500 }),
+    });
+    await alpha.decide({
+      approvalId: approval.id,
+      decision: "approve",
+      expectedVersion: approval.version,
+      paramsHash: approval.paramsHash,
+    });
+    const settled = await alpha.waitFor((projection) =>
+      projection.outcomes.some((outcome) => outcome.runId === runId),
+    );
+    const outcome = settled.outcomes.find((item) => item.runId === runId);
+    assert.equal(outcome?.resultCode, "tool_timeout");
+    assert.equal(outcome?.effect, "none");
+    assert.equal((await summary(ctx.gateway.baseUrl)).effects, 0);
+    await alpha.submit({
+      sessionId,
+      text: "/slow-read 继续",
+      providerMode: "demo",
+    });
+  } finally {
+    await ctx.cleanup();
+  }
+});
+
+test("an interrupted flush reports an uncertain write outcome", async (t) => {
+  const ctx = await bootGateway();
+  try {
+    const alpha = await ctx.pair("alpha");
+    const { runId } = await openAndSubmit(alpha, "写入后落盘失败");
+    const state = await alpha.waitFor((projection) =>
+      projection.approvals.some((approval) => approval.runId === runId),
+    );
+    const approval = state.approvals.find((item) => item.runId === runId);
+    assert.ok(approval);
+    t.mock.method(fs, "fsyncSync", () => {
+      throw new Error("模拟落盘失败");
+    });
+    await alpha.decide({
+      approvalId: approval.id,
+      decision: "approve",
+      expectedVersion: approval.version,
+      paramsHash: approval.paramsHash,
+    });
+    const settled = await alpha.waitFor((projection) =>
+      projection.outcomes.some((outcome) => outcome.runId === runId),
+    );
+    const outcome = settled.outcomes.find((item) => item.runId === runId);
+    assert.equal(outcome?.resultCode, "outcome_unknown");
+    assert.equal(outcome?.effect, "unknown");
+    assert.equal(fs.existsSync(`${ctx.dir}/sandbox/notes/${runId}.md`), true);
+    assert.equal((await summary(ctx.gateway.baseUrl)).effects, 0);
+  } finally {
+    await ctx.cleanup();
   }
 });
 
@@ -632,6 +860,52 @@ test("checkpoint lag reloads the ledger instead of writing again", async () => {
   }
 });
 
+test("startup closes approvals left pending by an old cancelled run", async () => {
+  const ctx = await bootGateway();
+  try {
+    const creator = await ctx.pair("发起人");
+    const approver = await ctx.pair("审批人");
+    const { sessionId, runId } = await openAndSubmit(creator, "历史取消恢复");
+    const ready = await approver.waitFor((projection) =>
+      projection.approvals.some((approval) => approval.runId === runId),
+    );
+    const approval = ready.approvals.find((item) => item.runId === runId);
+    assert.ok(approval);
+    const stamp = new Date().toISOString();
+    ctx.gateway.store.transaction(() => {
+      ctx.gateway.store.patchRun(runId, {
+        status: "cancelled",
+        result_code: "user_cancelled",
+        cancel_requested_at: stamp,
+        terminal_at: stamp,
+      });
+    });
+    await ctx.gateway.runtime.reload();
+    const restored = await approver.waitFor(
+      (projection) =>
+        projection.approvals.some(
+          (item) => item.id === approval.id && item.decision === "cancel",
+        ) && projection.outcomes.some((item) => item.runId === runId),
+    );
+    assert.equal(
+      restored.approvals.find((item) => item.id === approval.id)?.status,
+      "rejected",
+    );
+    assert.equal(
+      restored.outcomes.find((item) => item.runId === runId)?.resultCode,
+      "user_cancelled",
+    );
+    await creator.submit({
+      sessionId,
+      text: "继续同会话",
+      providerMode: "demo",
+    });
+    assert.equal((await summary(ctx.gateway.baseUrl)).effects, 0);
+  } finally {
+    await ctx.cleanup();
+  }
+});
+
 async function tokenOf(baseUrl: string): Promise<string> {
   const minted = await fetch(`${baseUrl}/v1/pairing/mint`, { method: "POST" });
   const body = (await minted.json()) as { code: string };
@@ -669,4 +943,83 @@ async function sign(
     body: JSON.stringify(body),
   });
   return ((await response.json()) as { cursor: string }).cursor;
+}
+
+type ModelRequestMessage = {
+  role: string;
+  content?: string;
+  tool_calls?: Array<{ id: string }>;
+  tool_call_id?: string;
+};
+
+async function bootModelProvider(
+  respond: (
+    index: number,
+  ) =>
+    | { message: Record<string, unknown>; error?: never }
+    | { error: string; message?: never }
+    | Promise<{ message: Record<string, unknown>; error?: never }>,
+) {
+  const requests: ModelRequestMessage[][] = [];
+  const server = createServer(async (request, response) => {
+    try {
+      let text = "";
+      request.setEncoding("utf8");
+      for await (const chunk of request) text += chunk;
+      const index = requests.length;
+      requests.push(
+        (JSON.parse(text) as { messages: ModelRequestMessage[] }).messages,
+      );
+      const result = await respond(index);
+      response.setHeader("content-type", "application/json");
+      if (result.error !== undefined) {
+        response.statusCode = 401;
+        response.end(JSON.stringify({ error: { message: result.error } }));
+        return;
+      }
+      response.end(
+        JSON.stringify({
+          id: `mock-${index}`,
+          object: "chat.completion",
+          created: 0,
+          model: "gpt-4o-mini",
+          choices: [
+            {
+              index: 0,
+              message: result.message,
+              finish_reason: result.message.tool_calls ? "tool_calls" : "stop",
+            },
+          ],
+        }),
+      );
+    } catch {
+      response.statusCode = 500;
+      response.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    url: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
+  };
+}
+
+function modelToolCalls(
+  calls: Array<[string, string, Record<string, unknown>]>,
+) {
+  return {
+    role: "assistant",
+    content: null,
+    tool_calls: calls.map(([id, name, args]) => ({
+      id,
+      type: "function",
+      function: { name, arguments: JSON.stringify(args) },
+    })),
+  };
 }

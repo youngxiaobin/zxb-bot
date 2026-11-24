@@ -1,4 +1,5 @@
 import { app, BrowserWindow, ipcMain, safeStorage } from "electron";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { CommandSchema, PROTOCOL } from "@pa/contracts";
@@ -7,14 +8,29 @@ import {
   MemoryProjectionStore,
   PersonalAgentClient,
   validateGatewayUrl,
+  type CredentialStore,
+  type SocketFactory,
 } from "@pa/sdk";
+import WebSocket from "ws";
 
-const credentials = new MemoryCredentialStore();
-let active = new PersonalAgentClient({
-  baseUrl: "http://127.0.0.1:47471",
-  credentials,
-  persistence: new MemoryProjectionStore(),
-});
+const DEFAULT_GATEWAY = "http://127.0.0.1:47471";
+const sockets: SocketFactory = {
+  connect(url) {
+    const socket = new WebSocket(url);
+    // 连接错误之后还会收到 close，由 SDK 统一处理重连。
+    socket.on("error", () => {});
+    return {
+      send: (data) => socket.send(data),
+      close: () => socket.close(),
+      onOpen: (callback) => socket.on("open", callback),
+      onMessage: (callback) =>
+        socket.on("message", (data) => callback(String(data))),
+      onClose: (callback) => socket.on("close", callback),
+    };
+  },
+};
+let active = createClient(DEFAULT_GATEWAY);
+let unsubscribeActive = active.subscribe(publishSnapshot);
 
 function credentialFile(): string {
   return path.join(app.getPath("userData"), "credentials.bin");
@@ -33,7 +49,11 @@ async function restoreCredentials(): Promise<void> {
     deviceId: string;
     userId: string;
   };
+  const credentials = new MemoryCredentialStore();
   await credentials.save(saved);
+  const restored = createClient(validateGatewayUrl(saved.baseUrl), credentials);
+  setActive(restored);
+  await restored.connect();
 }
 
 function saveCredentials(value: {
@@ -54,7 +74,7 @@ function createWindow(): void {
     width: 1280,
     height: 840,
     webPreferences: {
-      preload: path.join(app.getAppPath(), "dist/preload/preload.js"),
+      preload: path.join(app.getAppPath(), "dist/electron/preload/preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -75,17 +95,16 @@ function createWindow(): void {
     void win.loadFile(path.join(app.getAppPath(), "dist/renderer/index.html"));
 }
 
-app.whenReady().then(async () => {
-  await restoreCredentials();
+app.whenReady().then(() => {
   ipcMain.handle("pa:getSnapshot", () => active.getSnapshot());
   ipcMain.handle("pa:command", async (_event, input: unknown) => {
-    const record = input as { type?: string; idempotencyKey?: string };
-    const idempotencyKey = record.idempotencyKey ?? crypto.randomUUID();
+    const record = input as { idempotencyKey?: string } | null;
+    const idempotencyKey = record?.idempotencyKey ?? randomUUID();
     const command = CommandSchema.parse({
+      ...record,
       protocol: PROTOCOL,
       commandId: idempotencyKey,
       idempotencyKey,
-      ...(input as object),
     });
     return active.send(command);
   });
@@ -95,7 +114,8 @@ app.whenReady().then(async () => {
     if (fs.existsSync(file)) fs.rmSync(file);
   });
   ipcMain.handle("pa:mint", async (_event, baseUrl: string) => {
-    const response = await fetch(`${baseUrl}/v1/pairing/mint`, {
+    const url = validateGatewayUrl(baseUrl);
+    const response = await fetch(`${url}/v1/pairing/mint`, {
       method: "POST",
     });
     if (!response.ok) throw new Error("只能在网关本机申请配对码");
@@ -125,55 +145,70 @@ app.whenReady().then(async () => {
     },
   );
   createWindow();
+  void restoreCredentials().catch((error: unknown) => {
+    console.error(
+      "无法恢复桌面 Gateway 连接",
+      error instanceof Error ? error.message : "未知错误",
+    );
+  });
 });
+
+app.on("window-all-closed", () => app.quit());
 
 async function replaceClient(
   baseUrl: string,
   setup: (next: PersonalAgentClient) => Promise<void>,
 ): Promise<void> {
   const url = validateGatewayUrl(baseUrl);
-  const scratchCreds = new MemoryCredentialStore();
-  const scratch = new PersonalAgentClient({
-    baseUrl: url,
-    credentials: scratchCreds,
-    persistence: new MemoryProjectionStore(),
-  });
+  const credentials = new MemoryCredentialStore();
+  const next = createClient(url, credentials);
   try {
-    await setup(scratch);
-    await scratch.connect();
-  } catch (error) {
-    await scratch.forget();
-    throw error;
-  }
-  const snap = scratch.getSnapshot();
-  if (snap.connection !== "live") {
-    const message = snap.lastError?.message ?? "设备令牌无效、过期或已吊销。";
-    await scratch.forget();
-    throw new Error(message);
-  }
-  const fresh = await scratchCreds.load();
-  await scratch.forget();
-  if (!fresh?.token) throw new Error("没有得到设备令牌。");
-  await active.forget();
-  const file = credentialFile();
-  if (fs.existsSync(file)) fs.rmSync(file);
-  const next = new PersonalAgentClient({
-    baseUrl: url,
-    credentials,
-    persistence: new MemoryProjectionStore(),
-  });
-  await next.adoptToken(fresh.token);
-  await next.connect();
-  active = next;
-  const self = next.getSnapshot().self;
-  if (self) {
-    const full = {
-      baseUrl: url,
-      token: fresh.token,
-      deviceId: self.deviceId,
-      userId: self.userId,
-    };
+    await setup(next);
+    await next.connect();
+    const snapshot = next.getSnapshot();
+    if (snapshot.connection !== "live" || !snapshot.self) {
+      throw new Error(
+        snapshot.lastError?.message ?? "设备令牌无效、过期或已吊销。",
+      );
+    }
+    const saved = await credentials.load();
+    if (!saved?.token) throw new Error("没有得到设备令牌。");
+    const full = { baseUrl: url, token: saved.token, ...snapshot.self };
     await credentials.save(full);
     saveCredentials(full);
+  } catch (error) {
+    await next.forget();
+    throw error;
+  }
+  const previous = active;
+  setActive(next);
+  await previous.forget();
+}
+
+function createClient(
+  baseUrl: string,
+  credentials: CredentialStore = new MemoryCredentialStore(),
+) {
+  return new PersonalAgentClient({
+    baseUrl,
+    credentials,
+    persistence: new MemoryProjectionStore(),
+    sockets,
+  });
+}
+
+function setActive(next: PersonalAgentClient): void {
+  unsubscribeActive();
+  active = next;
+  unsubscribeActive = active.subscribe(publishSnapshot);
+  publishSnapshot();
+}
+
+function publishSnapshot(): void {
+  const snapshot = active.getSnapshot();
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.webContents.isDestroyed()) {
+      window.webContents.send("pa:snapshot", snapshot);
+    }
   }
 }

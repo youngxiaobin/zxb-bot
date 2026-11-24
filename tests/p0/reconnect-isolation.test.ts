@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { PROJECTION_VERSION } from "@pa/contracts";
 import {
   MemoryCredentialStore,
   MemoryProjectionStore,
@@ -139,5 +140,55 @@ test("replacing the gateway drops the old snapshot and cursor", async () => {
   } finally {
     await first.cleanup();
     await second.cleanup();
+  }
+});
+
+test("a saved expired cursor recovers a live subscription during connect", async () => {
+  const ctx = await bootGateway();
+  const credentials = new MemoryCredentialStore();
+  const persistence = new MemoryProjectionStore();
+  const client = new PersonalAgentClient({
+    baseUrl: ctx.gateway.baseUrl,
+    credentials,
+    persistence,
+  });
+  const resumed = new PersonalAgentClient({
+    baseUrl: ctx.gateway.baseUrl,
+    credentials,
+    persistence,
+  });
+  try {
+    const { code } = ctx.gateway.store.mintPairing(60_000);
+    await client.redeem({ code, deviceLabel: "回放", kind: "test" });
+    await client.connect();
+    const { sessionId, runId } = await openAndSubmit(client, "过期游标恢复");
+    const saved = await client.waitFor((projection) =>
+      projection.approvals.some((approval) => approval.runId === runId),
+    );
+    await client.disconnect();
+    assert.ok(saved.self);
+    const cursor = ctx.gateway.store.issueCursor(
+      saved.self.userId,
+      ctx.gateway.store.maxSeq(),
+      Date.now() - 1000,
+    );
+    await persistence.save({
+      version: PROJECTION_VERSION,
+      cursor,
+      projection: { ...saved, cursor, sessions: [] },
+    });
+    await resumed.connect();
+    assert.equal(resumed.getSnapshot().connection, "live");
+    assert.ok(
+      resumed.getSnapshot().sessions.some((item) => item.id === sessionId),
+    );
+    await resumed.cancel(runId);
+    await resumed.waitFor(
+      (projection) => projection.runs[runId]?.status === "cancelled",
+    );
+  } finally {
+    await resumed.disconnect();
+    await client.disconnect();
+    await ctx.cleanup();
   }
 });

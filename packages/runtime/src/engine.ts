@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { type BaseMessageLike, ToolMessage } from "@langchain/core/messages";
 import { Command, interrupt } from "@langchain/langgraph";
 import {
   TOOL_LIST,
@@ -16,6 +17,7 @@ import { FaultController } from "./faults.js";
 import { compileRunGraph } from "./graph.js";
 import {
   listFixtures,
+  NoteWriteUncertain,
   PathRejected,
   readFixture,
   writeDemoNote,
@@ -79,6 +81,7 @@ export class AgentRuntime {
 
   async startup(): Promise<void> {
     this.publish(this.store.reconcileDispatching());
+    this.publish(this.store.reconcileCancelledRuns());
     for (const runId of this.store.activeRootIds()) {
       await this.kick(runId);
     }
@@ -168,7 +171,11 @@ export class AgentRuntime {
       )
         return;
       await this.graph.invoke(new Command({ resume: { wake: true } }), config);
+      return;
     }
+    // 旧版本可能已推进检查点，却还没有为写入失败结束根运行。
+    if (this.writeTool(runId)?.status === "failed")
+      await this.finishWrite(runId);
   }
 
   private async step(state: {
@@ -200,7 +207,9 @@ export class AgentRuntime {
       if (run.provider_mode === "live") await this.liveWork(run);
       else await this.demoWork(run);
     }
-    await this.finishWrite(runId);
+    if (!TERMINAL.has(String(this.mustRun(runId).status))) {
+      await this.finishWrite(runId);
+    }
   }
 
   private async demoWork(run: SqlRow): Promise<void> {
@@ -225,6 +234,7 @@ export class AgentRuntime {
       return;
     }
     await this.runSpecialists(run);
+    if (TERMINAL.has(String(this.mustRun(runId).status))) return;
     if (!this.modelStep(runId, "synthesize")) return;
     const draft = this.compose(runId);
     this.preview(
@@ -249,7 +259,7 @@ export class AgentRuntime {
       approvalTtlMs: this.approvalTtlMs,
     });
     if (begun.blocked) {
-      this.publish([begun.event]);
+      if (begun.event) this.publish([begun.event]);
       this.store.patchRun(runId, { stage: "finalizing" });
       return;
     }
@@ -272,10 +282,7 @@ export class AgentRuntime {
     }
     const { completeLive } = await import("./live.js");
     const user = this.store.getMessage(String(run.root_message_id));
-    const messages: Array<{
-      role: "system" | "user" | "assistant";
-      content: string;
-    }> = [
+    const messages: BaseMessageLike[] = [
       {
         role: "system",
         content:
@@ -285,13 +292,29 @@ export class AgentRuntime {
     ];
     for (let step = 0; step < 6; step += 1) {
       if (!this.modelStep(runId, "live")) return;
-      const decision = await completeLive({
-        apiKey: this.openai.apiKey,
-        baseUrl: this.openai.baseUrl,
-        model: this.openai.model,
-        messages,
-        timeoutMs: this.toolTimeoutMs,
-      });
+      let decision: Awaited<ReturnType<typeof completeLive>>;
+      try {
+        decision = await completeLive({
+          apiKey: this.openai.apiKey,
+          baseUrl: this.openai.baseUrl,
+          model: this.openai.model,
+          messages,
+          timeoutMs: this.toolTimeoutMs,
+        });
+      } catch {
+        // 供应方的原始错误可能包含凭据或请求内容。
+        this.finishTerminal(run, {
+          status: "failed",
+          resultCode: "provider_failed",
+          errorCode: "PROVIDER_FAILED",
+          errorMessage: "实况模型请求失败。",
+          content: "实况模型请求失败，本次运行已结束。",
+          effect: "none",
+          eventType: "run.failed",
+        });
+        return;
+      }
+      if (TERMINAL.has(String(this.mustRun(runId).status))) return;
       if (decision.toolCalls.length === 0) {
         this.store.patchRun(runId, {
           stage: "finalizing",
@@ -299,10 +322,13 @@ export class AgentRuntime {
         });
         return;
       }
+      messages.push(decision.message);
       for (const call of decision.toolCalls) {
+        if (TERMINAL.has(String(this.mustRun(runId).status))) return;
+        let result: unknown;
         if (call.name === "delegate_specialists") {
           await this.runSpecialists(run);
-          messages.push({ role: "assistant", content: this.compose(runId) });
+          result = { summary: this.compose(runId) };
         } else if (call.name === "write_demo_note") {
           const body = String(call.args.body ?? decision.text ?? "");
           const title = String(call.args.title ?? "个人助理摘要");
@@ -321,19 +347,31 @@ export class AgentRuntime {
             requiresApproval: true,
             approvalTtlMs: this.approvalTtlMs,
           });
-          if (!begun.blocked) this.publish(begun.events);
-          else this.publish([begun.event]);
-          this.store.patchRun(runId, { output_draft: body });
-          return;
+          if (!begun.blocked) {
+            this.store.patchRun(runId, { output_draft: body });
+            this.publish(begun.events);
+            return;
+          }
+          if (!begun.event) return;
+          this.publish([begun.event]);
+          result = { error: "工具预算不足，未创建写入审批。" };
         } else if (call.name === TOOL_READ || call.name === TOOL_LIST) {
           const name = String(call.args.name ?? "weekly-notes.md");
-          await this.oneRead(
+          result = await this.oneRead(
             run,
             `live:${call.name}:${name}`,
             call.name === TOOL_LIST ? "" : name,
             call.name === TOOL_LIST,
           );
+        } else {
+          result = { error: "工具不受支持。" };
         }
+        messages.push(
+          new ToolMessage({
+            content: JSON.stringify(result),
+            tool_call_id: call.id,
+          }),
+        );
       }
     }
     this.finishTerminal(run, {
@@ -417,14 +455,37 @@ export class AgentRuntime {
       return;
     }
     if (after.status === "outcome_unknown") {
+      const applied = Boolean(
+        this.store.db
+          .prepare("SELECT 1 FROM effect_log WHERE tool_call_id=?")
+          .get(after.id),
+      );
       this.finishTerminal(fresh, {
         status: "failed",
         resultCode: "outcome_unknown",
         errorCode: "OUTCOME_UNKNOWN",
         errorMessage: "副作用结果未知，没有自动重放。",
-        content:
-          "写入结果未知。系统没有自动再写一次，请人工核对 sandbox/notes。",
-        effect: "unknown",
+        content: applied
+          ? "文件已写入，但工具结果没有确认。系统没有重新写入。"
+          : "写入结果未知。系统没有重新写入，请人工核对 sandbox/notes。",
+        effect: applied ? "applied" : "unknown",
+        resource: String(after.resource),
+        eventType: "run.failed",
+        preserveCancelled: Boolean(fresh.cancel_requested_at),
+      });
+      return;
+    }
+    if (after.status === "failed") {
+      const timeout = after.error_code === "TOOL_TIMEOUT";
+      this.finishTerminal(fresh, {
+        status: "failed",
+        resultCode: timeout ? "tool_timeout" : "write_failed",
+        errorCode: String(after.error_code ?? "TOOL_FAILED"),
+        errorMessage: String(after.error_message ?? "笔记写入失败。"),
+        content: timeout
+          ? "工具执行超时，笔记没有写入。"
+          : "笔记写入失败，本次运行已结束。",
+        effect: "none",
         resource: String(after.resource),
         eventType: "run.failed",
       });
@@ -465,6 +526,7 @@ export class AgentRuntime {
     if (Number(root.budget_reserved) >= Number(root.budget_total)) return;
     for (let index = 1; index <= Number(root.budget_total) + 1; index += 1) {
       const latest = this.mustRun(String(run.id));
+      if (TERMINAL.has(String(latest.status))) return;
       if (
         Number(latest.budget_reserved) >= Number(latest.budget_total) &&
         index > Number(latest.budget_reserved)
@@ -472,8 +534,8 @@ export class AgentRuntime {
         const begun = this.store.beginTool(
           this.readInput(run, `read:${index}`, "weekly-notes.md"),
         );
-        if (begun.blocked) this.publish([begun.event]);
-        else this.publish(begun.events);
+        if (!begun.blocked) this.publish(begun.events);
+        else if (begun.event) this.publish([begun.event]);
         break;
       }
       await this.oneRead(run, `read:${index}`, "weekly-notes.md");
@@ -485,16 +547,18 @@ export class AgentRuntime {
     logicalKey: string,
     name: string,
     list = false,
-  ): Promise<void> {
+  ): Promise<unknown> {
     const begun = list
       ? this.store.beginTool(this.listInput(run, logicalKey))
       : this.store.beginTool(this.readInput(run, logicalKey, name));
     if (begun.blocked) {
-      this.publish([begun.event]);
-      return;
+      if (begun.event) this.publish([begun.event]);
+      return { error: "工具未执行。" };
     }
     this.publish(begun.events);
-    await this.executeTool(begun.tool, false);
+    return (
+      (await this.executeTool(begun.tool, false)) ?? { error: "工具执行失败。" }
+    );
   }
 
   private async runSpecialists(run: SqlRow): Promise<void> {
@@ -518,6 +582,7 @@ export class AgentRuntime {
     },
   ): Promise<void> {
     await Promise.resolve();
+    if (TERMINAL.has(String(this.mustRun(String(run.id)).status))) return;
     const goal = String(
       this.store.getMessage(String(run.root_message_id))?.content ?? "",
     );
@@ -598,7 +663,7 @@ export class AgentRuntime {
               ),
             ]);
           }
-        } else this.publish([begun.event]);
+        } else if (begun.event) this.publish([begun.event]);
         this.store.finishExpert(String(task.id), {
           status: "failed",
           errorCode: "specialist_forced_failure",
@@ -730,7 +795,7 @@ export class AgentRuntime {
           this.readInput(run, logicalKey, name, expertRunId),
         );
     if (begun.blocked) {
-      this.publish([begun.event]);
+      if (begun.event) this.publish([begun.event]);
       return { blocked: true, result: null };
     }
     this.publish(begun.events);
@@ -761,17 +826,19 @@ export class AgentRuntime {
     if (!claim.claimed) return null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.toolTimeoutMs);
+    let noteCreated = false;
     try {
       await this.faults.delayBeforeEffect(controller.signal);
       await this.faults.holdBefore();
       const root = this.mustRun(String(tool.root_run_id));
-      if (sideEffect && root.cancel_requested_at) {
+      if (root.cancel_requested_at) {
         this.store.finishTool(String(tool.id), token, "cancelled", {
           errorCode: "user_cancelled",
-          errorMessage: "取消发生在副作用之前，没有写入。",
+          errorMessage: "取消发生在工具实际执行之前。",
         });
         return null;
       }
+      controller.signal.throwIfAborted();
       const params = JSON.parse(String(tool.params_json)) as {
         name?: string;
         body?: string;
@@ -779,31 +846,19 @@ export class AgentRuntime {
       };
       let result: unknown;
       if (sideEffect) {
-        try {
-          const written = writeDemoNote(
-            this.dataDir,
-            String(tool.root_run_id),
-            String(params.body ?? ""),
-          );
-          this.store.insertEffect(
-            String(tool.id),
-            String(tool.root_run_id),
-            "write",
-            written.path,
-          );
-          result = written;
-        } catch (error) {
-          const coded = error as { code?: string };
-          if (coded.code === "EEXIST") {
-            this.store.finishTool(String(tool.id), token, "outcome_unknown", {
-              errorCode: "OUTCOME_UNKNOWN",
-              errorMessage:
-                "目标文件已存在，系统没有覆盖，也没有把它当成新的成功写入。",
-            });
-            return null;
-          }
-          throw error;
-        }
+        const written = writeDemoNote(
+          this.dataDir,
+          String(tool.root_run_id),
+          String(params.body ?? ""),
+        );
+        noteCreated = true;
+        this.store.insertEffect(
+          String(tool.id),
+          String(tool.root_run_id),
+          "write",
+          written.path,
+        );
+        result = written;
         await this.faults.holdAfter();
         this.faults.crashIfNeeded();
       } else if (String(tool.tool_name) === TOOL_LIST) {
@@ -811,7 +866,11 @@ export class AgentRuntime {
       } else {
         result = readFixture(this.fixturesDir, String(params.name));
       }
-      this.store.finishTool(String(tool.id), token, "succeeded", { result });
+      if (
+        !this.store.finishTool(String(tool.id), token, "succeeded", { result })
+      ) {
+        return null;
+      }
       this.publish([
         this.store.transaction(() =>
           this.store.addEvent({
@@ -833,17 +892,31 @@ export class AgentRuntime {
       return result;
     } catch (error) {
       const coded = error as { code?: string; message?: string };
-      const code =
-        controller.signal.aborted || coded.code === "TOOL_TIMEOUT"
+      if (coded.code === "FENCE_LOST") throw error;
+      const uncertain =
+        sideEffect &&
+        (noteCreated ||
+          coded.code === "EEXIST" ||
+          error instanceof NoteWriteUncertain);
+      const code = uncertain
+        ? "OUTCOME_UNKNOWN"
+        : controller.signal.aborted || coded.code === "TOOL_TIMEOUT"
           ? "TOOL_TIMEOUT"
           : coded.code === "PATH_REJECTED" || error instanceof PathRejected
             ? "PATH_REJECTED"
             : "TOOL_FAILED";
-      const message = coded.message ?? "工具失败";
-      this.store.finishTool(String(tool.id), token, "failed", {
-        errorCode: code,
-        errorMessage: message,
-      });
+      const message = uncertain
+        ? "无法确认笔记的完整写入结果，请人工核对目标文件。"
+        : (coded.message ?? "工具失败");
+      if (
+        !this.store.finishTool(
+          String(tool.id),
+          token,
+          uncertain ? "outcome_unknown" : "failed",
+          { errorCode: code, errorMessage: message },
+        )
+      )
+        return null;
       if (code === "TOOL_TIMEOUT") {
         this.store.patchRun(String(tool.root_run_id), {
           error_code: "TOOL_TIMEOUT",
@@ -858,7 +931,7 @@ export class AgentRuntime {
             sessionId: String(tool.session_id),
             runId: String(tool.root_run_id),
             taskId: String(tool.id),
-            type: "tool.failed",
+            type: uncertain ? "tool.outcome_unknown" : "tool.failed",
             payload: { toolCallId: tool.id, errorCode: code, message },
           }),
         ),
@@ -890,6 +963,7 @@ export class AgentRuntime {
     const events = this.store.transaction(() => {
       const fresh = this.mustRun(String(run.id));
       if (this.store.assistantMessageForRun(String(fresh.id))) return [];
+      if (fresh.status === "cancelled" && !input.preserveCancelled) return [];
       const preserve =
         input.preserveCancelled &&
         (fresh.cancel_requested_at || fresh.status === "cancelled");
@@ -931,7 +1005,12 @@ export class AgentRuntime {
           sessionId: String(fresh.session_id),
           runId: String(fresh.id),
           type: preserve ? "run.cancelled" : input.eventType,
-          payload: { runId: fresh.id, resultCode: input.resultCode },
+          payload: {
+            runId: fresh.id,
+            resultCode: input.resultCode,
+            errorCode: input.errorCode,
+            errorMessage: input.errorMessage,
+          },
         }),
         this.store.addEvent({
           userId: String(fresh.user_id),
@@ -974,6 +1053,7 @@ export class AgentRuntime {
   }
 
   private modelStep(runId: string, phase: string): boolean {
+    if (TERMINAL.has(String(this.mustRun(runId).status))) return false;
     const ok = this.store.recordModelStep(runId);
     const run = this.mustRun(runId);
     if (!ok) {

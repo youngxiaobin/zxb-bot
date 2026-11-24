@@ -1,3 +1,4 @@
+import type { BaseMessageLike } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { ChatOpenAI } from "@langchain/openai";
 import { z } from "zod";
@@ -37,12 +38,9 @@ export async function completeLive(input: {
   apiKey: string;
   baseUrl?: string;
   model: string;
-  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  messages: BaseMessageLike[];
   timeoutMs: number;
-}): Promise<{
-  text: string;
-  toolCalls: Array<{ name: string; args: Record<string, unknown> }>;
-}> {
+}) {
   if (!input.apiKey) {
     throw Object.assign(new Error("未配置实况模型"), {
       code: "PROVIDER_NOT_CONFIGURED",
@@ -62,9 +60,12 @@ export async function completeLive(input: {
     typeof response.content === "string"
       ? response.content
       : JSON.stringify(response.content);
-  const toolCalls = (response.tool_calls ?? []).map((call) => ({
-    name: call.name,
-    args: (call.args ?? {}) as Record<string, unknown>,
-  }));
-  return { text, toolCalls };
+  if (response.invalid_tool_calls?.length) {
+    throw new Error("实况模型返回了无效的工具调用。");
+  }
+  const toolCalls = (response.tool_calls ?? []).map((call) => {
+    if (!call.id) throw new Error("实况模型的工具调用缺少编号。");
+    return { id: call.id, name: call.name, args: call.args };
+  });
+  return { message: response, text, toolCalls };
 }

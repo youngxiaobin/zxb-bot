@@ -155,37 +155,19 @@ async function main(): Promise<void> {
       sessionId = String((opened.result as { sessionId: string }).sessionId);
       await client.resync();
     }
-    await client.submit({
+    const receipt = await client.submit({
       sessionId,
       text,
       providerMode: rest.includes("--live") ? "live" : "demo",
     });
-    await client.waitFor((projection) => {
-      const runs = Object.values(projection.runs).filter(
-        (run) => run.sessionId === sessionId,
-      );
-      return runs.some((run) =>
-        [
-          "completed",
-          "failed",
-          "cancelled",
-          "timed_out",
-          "awaiting_approval",
-        ].includes(run.status),
-      );
-    });
-    const pending = client
-      .getSnapshot()
-      .approvals.find(
-        (item) => item.sessionId === sessionId && item.status === "pending",
-      );
+    const { runId } = receipt.result as { runId: string };
+    const { pending, reply } = await waitForRun(client, sessionId, runId);
     if (pending) {
       process.stdout.write(
         `等待审批 ${pending.id} 版本 ${pending.version}\n工具 ${pending.toolName}\n目标 ${pending.resource}\n`,
       );
     }
-    const last = (client.getSnapshot().messages[sessionId] ?? []).at(-1);
-    if (last?.role === "assistant") process.stdout.write(`${last.content}\n`);
+    if (reply) process.stdout.write(`${reply.content}\n`);
     await client.disconnect();
     process.exit(0);
   }
@@ -236,34 +218,15 @@ async function chat(
           resolve();
           return;
         }
-        await client.submit({ sessionId, text, providerMode });
-        await client.waitFor((projection) => {
-          const runs = Object.values(projection.runs).filter(
-            (run) => run.sessionId === sessionId,
-          );
-          return runs.some((run) =>
-            [
-              "completed",
-              "failed",
-              "cancelled",
-              "timed_out",
-              "awaiting_approval",
-            ].includes(run.status),
-          );
-        });
-        const snap = client.getSnapshot();
-        const pending = snap.approvals.find(
-          (item) => item.status === "pending",
-        );
+        const receipt = await client.submit({ sessionId, text, providerMode });
+        const { runId } = receipt.result as { runId: string };
+        const { pending, reply } = await waitForRun(client, sessionId, runId);
         if (pending) {
           process.stdout.write(
             `等待审批 ${pending.id}\n工具 ${pending.toolName}\n目标 ${pending.resource}\n参数 ${JSON.stringify(pending.params)}\n`,
           );
         }
-        const messages = snap.messages[sessionId] ?? [];
-        const last = messages[messages.length - 1];
-        if (last?.role === "assistant")
-          process.stdout.write(`${last.content}\n`);
+        if (reply) process.stdout.write(`${reply.content}\n`);
         rl.prompt();
         rl.resume();
       })().catch((error: unknown) => {
@@ -290,3 +253,30 @@ main().catch((error: unknown) => {
   );
   process.exit(1);
 });
+
+async function waitForRun(
+  client: PersonalAgentClient,
+  sessionId: string,
+  runId: string,
+) {
+  const snapshot = await client.waitFor((projection) => {
+    const status = projection.runs[runId]?.status;
+    return (
+      status === "completed" ||
+      status === "failed" ||
+      status === "cancelled" ||
+      status === "timed_out" ||
+      projection.approvals.some(
+        (approval) => approval.runId === runId && approval.status === "pending",
+      )
+    );
+  });
+  return {
+    pending: snapshot.approvals.find(
+      (approval) => approval.runId === runId && approval.status === "pending",
+    ),
+    reply: snapshot.messages[sessionId]?.findLast(
+      (message) => message.runId === runId && message.role === "assistant",
+    ),
+  };
+}
